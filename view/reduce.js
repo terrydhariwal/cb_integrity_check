@@ -3,29 +3,33 @@ function (keys, values, rereduce) {
   var k;
   if(rereduce) {
     // values now contains groups
-    // { values: ["jj"], key: "main3", main: ["joel@basho.com", "joeljacobson"] }
+    // { stale_lookup_keys: ["jj"], parent_key: "main3", valid_lookups: ["joel@basho.com", "joeljacobson"] }
     // we need to merge them to further process them
     values.forEach(function(e) {
-      if(!groups[e.key]) {
+      if(!groups[e.parent_key]) {
         // nothing to merge
-        groups[e.key] = e;
+        groups[e.parent_key] = e;
       } else {
-        groups[e.key].key = e.key;
-        // merge the values, there shouldn't be duplicates
-        group.values.concat(e.values);
-        // main is either null or the same
-        groups[e.key].main = groups[e.key].main || e.main
-        // merge the missmatch and matched counts
-        groups[e.key].miss += e.miss
-        groups[e.key].matched += e.matched
+        groups[e.parent_key].parent_key = e.parent_key;
+        
+        // merge the stale_lookup_keys, there shouldn't be duplicates
+        group.all_matched_lookup_keys.concat(e.all_matched_lookup_keys);
+        group.stale_lookup_keys.concat(e.stale_lookup_keys);
+        group.missing_lookup_keys.concat(e.missing_lookup_keys);
+
+
+
+        // valid_lookups is either null or the same
+        groups[e.parent_key].valid_lookups = groups[e.parent_key].valid_lookups || e.valid_lookups
+        
       }
-    })
+    });
   } else {
     // Create the groups acording to the keys
 
     // The groups look like this:
-    // { values: ["jj"], key: "main3", main: ["joel@basho.com", "joeljacobson"] }
-    // in case the view is queried in a grouped way there will only be one key
+    // { stale_lookup_keys: ["jj"], parent_key: "main3", valid_lookups: ["joel@basho.com", "joeljacobson"] }
+    // in case the view is queried in a grouped way there will only be one parent_key
     // if they are queried un grouped ther will be N
     var ck;
     var group;
@@ -33,14 +37,28 @@ function (keys, values, rereduce) {
       // process the keys in groups
       if(keys[k] != ck) {
         ck = keys[k];
-        groups[ck] = {values: [], key: ck, main: null, miss: 0, matched: 0};
+        //groups[ck] = {all_matched_lookup_keys : [], stale_lookup_keys: [], parent_key: ck, valid_lookups: null, missing_lookup_keys: null, num_stale_lookups: 0};
+        groups[ck] = {all_matched_lookup_keys : [], stale_lookup_keys: [], parent_key: ck, valid_lookups: null, missing_lookup_keys: null, 
+          num_matched_lookups : 0,   num_stale_lookups : 0, num_valid_lookups : 0, num_missing_lookups : 0};
+          
         group = groups[ck];
       }
+      //if $isSource exists - then this is the main document - 
+      ///therefore $isSource and break
       if(values[k][0] == "$isSource"){
         values[k].shift();
-        group.main = values[k];
-      } else {
-        group.values.push(values[k][0]);
+        group.valid_lookups = values[k];     
+        //initialise missing keys with valid_lookups  
+        group.missing_lookup_keys = group.valid_lookups.slice(0);
+
+      }
+      //then the result is a lookup - add it to the group's stale_lookup_keys array
+      else {
+        //add lookup to stake keys - for later processing
+        group.stale_lookup_keys.push(values[k][0]);
+        //no need to add to missing_lookup_keys - because that already initisalised to all valid keys
+        //but need to add to all_matched_lookup_keys
+        group.all_matched_lookup_keys.push(values[k][0]);
       }
     }
   }
@@ -52,49 +70,95 @@ function (keys, values, rereduce) {
   // if you expect many.
 
   // The result is a structure like this:
-  // {"values":[],"key":"main1","main":["philipp.fehre@gmail.com","ischi"],"miss":0,"matched":1,"missmatches":1}
+  // {"values":[],"parent_key":"main1","valid_lookups":["philipp.fehre@gmail.com","ischi"],"num_matched_lookups":0, "num_stale_lookups":0, "num_valid_lookups":0, "num_missing_lookups":0 ,"missmatches":1}
   //
-  // values: indicate all references which should not be present because they are not present in the main document
-  // key: the key of the main document
+  // stale_lookup_keys: indicate all references which should not be present because they are not present in the main document
+  // parent_key: the parent_key of the main document
   // main: all the references that were checked, if main is null the main document is missing
   // missmatches: the number if incorrect references, either missing or wrong
 
-  // miss: the number of times a refence key was not matched in the main (internal)
-  // matched: the number of times a refece key was matched to the main (internal)
-
   var curr;
   var res = [];
-  var miss;
-  var matched;
+  var num_stale_lookups = 0;
+
+  var debug = false;
+  var output = "|"; for(o in groups) { output += groups[o].stale_lookup_keys; } output += "|"; 
+
+  function removeA(arr) {
+    var what, a = arguments, L = a.length, ax;
+    while (L > 1 && arr.length) {
+        what = a[--L];
+        while ((ax= arr.indexOf(what)) !== -1) {
+            arr.splice(ax, 1);
+        }
+    }
+    return arr;
+  }
 
   for(k in groups) {
-
+    for(o in groups) { output += groups[o].stale_lookup_keys; } output += "|"; 
     curr = groups[k];
 
-    if(!curr.main) {
+    if(!curr.valid_lookups) {
       // the main document is missing, needs to be checked!
       curr.missmatches = "all";
       res.push(curr);
     } else {
-      var indexesToRemove = [];
-      curr.values.forEach(function(e, idx) {
-        if(curr.main.indexOf(e) == -1) {
-          curr.miss++;
-          curr.matched++;
-        } else {
-          indexesToRemove.push(idx);
-          curr.matched++;
+      //var indexesToRemoveFrom_stale_lookup_keys_by_idx = [];
+      var indexesToRemoveFrom_stale_lookup_keys_by_val = [];
+      var indexesToRemoveFrom_missing_lookup_keys_by_val = [];
+      curr.stale_lookup_keys.forEach(function(e, idx) {
+        //if the value does not exist in the valid_lookups array - then this lookup is stale
+        if(curr.valid_lookups.indexOf(e) == -1) {
+          curr.num_stale_lookups++;
+        } 
+        //if value exists in the valid_lookups array - then all is good - therefore, we can remove this from the stale_lookup_keys
+        else {
+          //indexesToRemoveFrom_stale_lookup_keys_by_idx.push(idx);
+          indexesToRemoveFrom_stale_lookup_keys_by_val.push(e);
+          //output += "idx=" + idx + ", e=" + e + "|";
         }
+
       });
-      // remove all the items we have matched from the values
-      indexesToRemove.forEach(function(idx) {
-        curr.values.splice(idx, 1);
-      })
-      curr.missmatches = curr.miss + (curr.main.length - curr.matched);
+      curr.missing_lookup_keys.forEach(function(e, idx) {
+        //if the value matches - then it exists in the all_matched_lookup_keys array - then this lookup is NOT missing
+        if(curr.all_matched_lookup_keys.indexOf(e) != -1) {
+          //curr.num_stale_lookups++;
+          indexesToRemoveFrom_missing_lookup_keys_by_val.push(e);
+        } 
+
+      });
+      // remove all the items we have matched from the stale_lookup_keys
+      /*indexesToRemoveFrom_stale_lookup_keys_by_idx.forEach(function(idx) {
+        //curr.stale_lookup_keys.splice(idx, 1);
+        curr.stale_lookup_keys.splice(idx, 1);
+      });*/
+      for(var skey in indexesToRemoveFrom_stale_lookup_keys_by_val) {
+        output += "skey=" + indexesToRemoveFrom_stale_lookup_keys_by_val[skey] + "|";
+        removeA(curr.stale_lookup_keys, indexesToRemoveFrom_stale_lookup_keys_by_val[skey]);
+      };
+      for(var mkey in indexesToRemoveFrom_missing_lookup_keys_by_val) {
+        output += "mkey=" + indexesToRemoveFrom_missing_lookup_keys_by_val[mkey] + "|";
+        removeA(curr.missing_lookup_keys, indexesToRemoveFrom_missing_lookup_keys_by_val[mkey]);
+      };      
+
+      curr.num_matched_lookups = curr.all_matched_lookup_keys.length;
+      curr.num_valid_lookups = curr.valid_lookups.length;
+      curr.num_stale_lookups = curr.stale_lookup_keys.length;
+      curr.num_missing_lookups = curr.missing_lookup_keys.length;
+
+      //curr.missmatches = curr.num_stale_lookups + (curr.valid_lookups.length - curr.matched);
+      //curr.missmatches = curr.num_valid_lookups - curr.num_matched_lookups;      
+      if(curr.num_stale_lookups > 0 || curr.num_missing_lookups > 0) curr.missmatches = -1;
+      else curr.missmatches = 0;
+
       if(curr.missmatches != 0) {
         res.push(curr);
       }
     }
   }
+  for(o in groups) { output += groups[o].stale_lookup_keys; } output += "|";  
+  if(debug)
+  return output;
   return res;
 }
